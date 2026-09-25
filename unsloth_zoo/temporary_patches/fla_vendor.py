@@ -234,6 +234,122 @@ def _torch_triton_cuda_supported():
     return True
 
 
+# RDNA1 parts with no dot instructions at all (LLVM AMDGPU: gfx1010 and gfx1013 lack
+# dot1/dot2-insts; gfx1011/gfx1012 have them, gfx103x has them). Triton's AMD backend
+# still lowers a 16-bit tl.dot to v_dot2 there, so every fla chunk kernel dies at
+# compile time inside LLVM, taking the whole process with it:
+#   LLVM ERROR: Cannot select: AMDGPUISD::FDOT2
+# Nothing in fla can run on these GPUs; transformers' pure-torch gated-delta path can.
+_NO_DOT_INSTRUCTION_GFX = ("gfx1010", "gfx1013")
+
+
+def _gpu_lacks_dot_instructions(torch_mod=None):
+    """True on a ROCm build when any visible GPU is an RDNA1 part without dot instructions.
+
+    Every visible device is checked, not just device 0, for the same reason as the Hopper
+    probe: a model can be placed on a nonzero card. Anything unreadable answers False."""
+    try:
+        if torch_mod is None:
+            import torch as torch_mod
+        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+            return False
+        if not torch_mod.cuda.is_available():
+            return False
+        for i in range(int(torch_mod.cuda.device_count())):
+            props = torch_mod.cuda.get_device_properties(i)
+            arch = str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
+            if arch in _NO_DOT_INSTRUCTION_GFX:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mark_fla_disabled_no_dot_instructions():
+    global _FLA_DISABLED_REASON
+    if _FLA_DISABLED_REASON is not None:
+        return
+    _FLA_DISABLED_REASON = (
+        "Unsloth: gated-deltanet (linear attention) fast kernels are DISABLED on this GPU.\n"
+        "RDNA1 (gfx1010 / gfx1013, e.g. RX 5700 XT) has no dot instructions, and Triton\n"
+        "compiles flash-linear-attention's kernels to them anyway, so the process would\n"
+        "abort inside LLVM (\"Cannot select: AMDGPUISD::FDOT2\"). Training uses the slower\n"
+        "pure-PyTorch gated-delta path instead."
+    )
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.warning(_FLA_DISABLED_REASON)
+
+
+# transformers' pure-torch gated-delta path normalises q and k with a module-level
+# ``l2norm`` that runs in the INPUT dtype:  x * rsqrt((x * x).sum(-1) + eps).  The fla
+# kernel it stands in for does that sum in float32. In float16 the sum of squares
+# overflows to inf well within normal activations (128 * 23^2 already exceeds 65504),
+# rsqrt(inf) gives a finite 0 forward, and the scaled gradient of fp16 training turns
+# inf * 0 into NaN in RsqrtBackward. Seen on an RX 5700 XT through Unsloth Studio:
+# loss finite at step 1, grad_norm NaN, NaN from step 2. torch.compile hides it
+# (Inductor upcasts the reduction); eager mode, which Unsloth Studio forces on Windows
+# ROCm via TORCHDYNAMO_DISABLE, does not.
+_L2NORM_FP32_MARK = "_unsloth_fp32_l2norm"
+
+
+def _fp32_l2norm(x, dim = -1, eps = 1e-6):
+    """``l2norm`` with the reduction in float32, result in the input dtype: what fla's kernel does."""
+    import torch
+
+    xf = x.float()
+    inv_norm = torch.rsqrt((xf * xf).sum(dim = dim, keepdim = True) + eps)
+    return (xf * inv_norm).to(x.dtype)
+
+
+setattr(_fp32_l2norm, _L2NORM_FP32_MARK, True)
+
+
+# unsloth's compiler copies the modeling source into its own module,
+# ``unsloth_compiled_module_<model_type>`` (unsloth_zoo.compiler.COMBINED_UNSLOTH_NAME),
+# l2norm included, and the model runs THAT copy. Patching transformers' module alone
+# leaves the live one untouched, which is exactly what happened on the first try.
+_UNSLOTH_COMPILED_MODULE_PREFIX = "unsloth_compiled_module"
+
+
+def _l2norm_modules(packages = None):
+    """Modules whose ``l2norm`` the pure-torch gated-delta path can run: transformers'
+    gated-delta modeling modules and unsloth's compiled copies of them, imported or not."""
+    if packages is None:
+        packages = _GATED_DELTA_MODELING
+    names = [f"transformers.models.{pkg}.modeling_{pkg}" for pkg in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    return names
+
+
+def _patch_l2norm_fp32_on_torch_path(packages = None):
+    """Rebind ``l2norm`` on every already-imported gated-delta module, transformers' and
+    unsloth's compiled copy alike, to the float32-safe version. Idempotent; modules
+    without an ``l2norm`` are left alone. Returns the module names patched this call.
+
+    Runs from every temporary-patch phase: the modeling module is imported by
+    ``pre_compile``, the compiled copy exists by ``post_compile``, both before the
+    first forward."""
+    patched = []
+    for modname in _l2norm_modules(packages):
+        mod = sys.modules.get(modname)
+        if mod is None:
+            continue
+        current = getattr(mod, "l2norm", None)
+        if current is None or getattr(current, _L2NORM_FP32_MARK, False):
+            continue
+        try:
+            setattr(mod, "l2norm", _fp32_l2norm)
+        except Exception:
+            continue
+        patched.append(modname)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: {modname}.l2norm now reduces in float32 (pure-torch gated delta, float16 safe).")
+    return patched
+
+
 def _hopper_dqkwg_suspect_here():
     """``_hopper_dqkwg_suspect`` for the live interpreter, or False if unknowable."""
     try:
@@ -1122,6 +1238,64 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     return tuple(repaired)
 
 
+def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING):
+    """Bind the kernel-hub decorators straight to their pure-torch fallback.
+
+    The RDNA1 counterpart to ``_repair_kernel_hub_closures``. On a GPU without dot
+    instructions every fla kernel aborts the process at compile (FDOT2), so on the
+    post-#47630 layout we must not let the closure repair re-resolve the decorators
+    to a user-installed fla. Rebinding each wrapper to its ``__wrapped__`` (the torch
+    implementation the decorator falls back to) keeps the model on pure torch without
+    importing fla at all. Returns the names forced, for logging and tests.
+
+    Scope is ``_GATED_DELTA_MODELING``, not ``_REPAIR_MODELING``: unlike the repair,
+    which only rebinds vendor-covered models onto the live fla, here every gated-delta
+    consumer that carries the decorator must be forced off it. olmo_hybrid is not
+    vendor-covered, but its wrapper still resolves to an installed fla that would abort,
+    so it must fall back too (the loop is a no-op when it lacks the attribute).
+
+    unsloth's compiler copies the gated-delta source (including the kernel-hub
+    decorators, which are only marked ``torch.compiler.disable``, not stripped) into
+    ``unsloth_compiled_module_<model_type>``, and THAT copy is what runs. Its
+    decorator re-resolves fla independently, so the compiled module is scanned too,
+    the same way ``_patch_l2norm_fp32_on_torch_path`` does; otherwise the compiled
+    forward would still enter the installed fla and abort with FDOT2.
+    """
+    try:
+        from transformers.integrations.hub_kernels import (  # noqa: F401
+            use_kernel_func_from_hub_with_fallback,
+        )
+    except Exception:
+        return ()               # transformers predates the decorator
+
+    forced = []
+    names = [f"transformers.models.{package}.modeling_{package}" for package in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    for modname in names:
+        module = sys.modules.get(modname)
+        if module is None:
+            continue
+        for attribute in _KERNEL_HUB_DECORATED:
+            wrapper = getattr(module, attribute, None)
+            original = getattr(wrapper, "__wrapped__", None)
+            if original is None:
+                continue        # not decorated on this transformers
+            if wrapper is original:
+                continue        # already the bare fallback
+            setattr(module, attribute, original)
+            forced.append(f"{modname}.{attribute}")
+
+    if forced and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: forced the fla kernels on {', '.join(forced)} to the pure-torch "
+            f"fallback (no dot instructions on this GPU)."
+        )
+    return tuple(forced)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
@@ -1130,20 +1304,34 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
-        # Every early return in _patch_vendor_fla leaves some fla live, and all of
-        # them are missing the decode name, so the alias goes on the way out rather
-        # than at each return, where the next one added would quietly skip it.
-        # The closure repair follows the alias, since it resolves through it.
-        try:
-            _alias_missing_gated_delta_names()
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
-        try:
-            _repair_kernel_hub_closures()
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+        if _gpu_lacks_dot_instructions():
+            # RDNA1: every fla kernel aborts at compile, so fla must never be made
+            # reachable. Skip the alias (it imports fla and would bind its equally
+            # dead decode kernel) and force the kernel-hub decorators onto their
+            # pure-torch fallback, rather than letting _repair_kernel_hub_closures
+            # re-resolve them to a user-installed fla on the post-#47630 layout.
+            try:
+                _force_kernel_hub_fallback()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(
+                        f"Unsloth: could not force fla kernel closures to the pure-torch fallback: {e}"
+                    )
+        else:
+            # Every early return in _patch_vendor_fla leaves some fla live, and all of
+            # them are missing the decode name, so the alias goes on the way out rather
+            # than at each return, where the next one added would quietly skip it.
+            # The closure repair follows the alias, since it resolves through it.
+            try:
+                _alias_missing_gated_delta_names()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+            try:
+                _repair_kernel_hub_closures()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
 
 
 def _patch_vendor_fla(phase=None):
@@ -1155,6 +1343,29 @@ def _patch_vendor_fla(phase=None):
     # installed fla stays importable, so transformers' own availability probe would
     # answer True and bind the unpatched kernels (unslothai/unsloth#5276).
     optout_degraded = False
+    # Not an opt-out: on an RDNA1 GPU no fla kernel can compile (see
+    # _NO_DOT_INSTRUCTION_GFX), so the only working path is transformers' pure-torch
+    # one. Unlike the Hopper switch below, injection itself is the harm here: any fla
+    # the loader makes reachable aborts the process at compile inside LLVM, so the
+    # vendored tree must never be injected, on EITHER Transformers layout. That is why
+    # this gate returns regardless of _transformers_uses_availability_probe(), where
+    # the Hopper opt-out falls through to injection on the post-#47630 layout.
+    if _gpu_lacks_dot_instructions():
+        _mark_fla_disabled_no_dot_instructions()
+        # Sample the layout BEFORE _patch_is_available, which assigns the probe
+        # attribute unconditionally (see _transformers_uses_availability_probe).
+        if _transformers_uses_availability_probe():
+            _patch_is_available(_unavailable_probe)
+        # else: post-#47630 the kernel-hub decorator resolves fla with importlib, so no
+        # probe steers it. Skipping injection is not enough on its own: a user-installed
+        # fla is still importable, and the finally would re-resolve the decorators back
+        # to it. _force_kernel_hub_fallback (in the finally) instead binds them to the
+        # pure-torch fallback, so no fla kernel is ever reached.
+        _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
+        # The pure-torch path is only correct in float16 (all these GPUs have) with the
+        # q/k l2norm reducing in float32, as the fla kernel it replaces does.
+        _patch_l2norm_fp32_on_torch_path()
+        return
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
         # Sample the layout BEFORE _patch_is_available, which assigns the probe
         # attribute unconditionally and would otherwise make every Transformers
